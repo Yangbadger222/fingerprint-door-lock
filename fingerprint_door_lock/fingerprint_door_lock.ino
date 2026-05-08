@@ -148,6 +148,9 @@ int16_t  bannerX = TFT_W;
 unsigned long lastBannerMs = 0;
 uint8_t  bannerMsgIdx = 0;
 
+// drawLockout 首帧绘制标志
+bool _lockoutDrawn = false;
+
 // 音符
 #define N_C4 262
 #define N_E4 330
@@ -177,7 +180,7 @@ void drawFpIcon(int x, int y, int r, uint16_t col, uint8_t f);
 void drawPet(int x, int y, uint8_t emotion, uint8_t frame);
 void drawMsgBanner();
 void drawXMark(int x, int y, int s);
-void drawSparkle(int x, int y, int s, uint16_t col);
+// drawSparkle removed
 
 void setRGB(uint8_t r, uint8_t g, uint8_t b);
 void breathRGB(uint8_t r, uint8_t g, uint8_t b);
@@ -311,10 +314,11 @@ void handleIdle() {
     animFrame++;
     drawIdle();
   }
-  // 有未读留言用紫色慢闪, 否则红色呼吸
+  // 有未读留言用紫色慢闪, 否则红色呼吸 (整数三角波, 不用浮点)
   if (hasUnreadMsg) {
-    float k = (sin(millis() / 600.0) + 1.0) * 0.5;
-    setRGB(120 * k, 0, 180 * k);
+    uint8_t t = (millis() >> 4) & 0xFF;
+    uint8_t k = (t < 128) ? (t << 1) : ((255 - t) << 1);
+    setRGB((uint8_t)((uint16_t)k * 120 / 255), 0, (uint8_t)((uint16_t)k * 180 / 255));
   } else {
     breathRGB(80, 0, 0);
   }
@@ -348,7 +352,9 @@ void handleWaitFp() {
     animFrame++;
     drawWaitFp();
   }
-  uint8_t v = (sin(millis() / 150.0) + 1.0) * 127;
+  // 蓝色脉冲 (三角波代替 sin)
+  uint8_t pt = (millis() >> 2) & 0xFF;
+  uint8_t v = (pt < 128) ? (pt << 1) : ((255 - pt) << 1);
   setRGB(0, 0, v);
 
   int r = fpMatch();
@@ -447,7 +453,6 @@ void handleLockout() {
     lastFrameMs = millis();
     drawLockout();
   }
-  // 红灯爆闪
   uint8_t v = ((millis() / 120) % 2) ? 255 : 0;
   setRGB(v, 0, 0);
 
@@ -456,6 +461,7 @@ void handleLockout() {
     state = S_IDLE;
     stateT = millis();
     tft.fillScreen(C_BG);
+    _lockoutDrawn = false;
   }
 }
 
@@ -495,19 +501,14 @@ int fpMatch() {
 // ==================== Drawing ====================
 void drawBoot() {
   tft.fillScreen(C_BG);
-  // 扫描线
-  for (int y = 0; y < TFT_H; y += 4) {
-    tft.drawFastHLine(0, y, TFT_W, C_DIM);
-  }
   drawLockIcon(120, 50, 80, 110, false, C_ACCENT);
   tft.setTextColor(C_FG);
   tft.setTextSize(3);
   tft.setCursor(40, 175);
   tft.print(F("Smart Door Lock"));
   tft.setTextSize(1);
-  tft.setTextColor(C_DIM);
-  tft.setCursor(100, 215);
-  tft.print(F("Nano ATmega328  v2.0"));
+  tft.setCursor(120, 215);
+  tft.print(F("v2.0"));
 }
 
 void drawIdle() {
@@ -550,26 +551,22 @@ void drawIdle() {
 }
 
 void drawWake() {
-  drawHeaderBar(F("Voice Wake"), C_WAKE);
-  // 麦克风扩散动画 - 中心圆 + 三圈
+  drawHeaderBar(F("Wake"), C_WAKE);
+  // 简化: 一个扩张圆 (无环擦除)
   int cx = TFT_W / 2, cy = TFT_H / 2;
   static int lastR = 0;
   int r = 20 + (animFrame * 6) % 80;
-  // 抹掉旧圈
   if (lastR != r) {
     tft.drawCircle(cx, cy, lastR, C_BG);
-    tft.drawCircle(cx, cy, lastR + 1, C_BG);
     lastR = r;
   }
   tft.fillCircle(cx, cy, 18, C_WAKE);
   tft.fillRect(cx - 4, cy + 16, 8, 14, C_WAKE);
-  tft.drawFastHLine(cx - 14, cy + 32, 28, C_WAKE);
   tft.drawCircle(cx, cy, r, C_WAKE);
-  tft.drawCircle(cx, cy, r + 1, C_WAKE);
 }
 
 void drawWaitFp() {
-  drawHeaderBar(F("Place Finger"), C_ACCENT);
+  drawHeaderBar(F("Finger?"), C_ACCENT);
   int cx = TFT_W / 2, cy = 110;
   drawFpIcon(cx - 35, cy - 45, 35, C_ACCENT, animFrame);
 
@@ -584,7 +581,7 @@ void drawWaitFp() {
 }
 
 void drawOk(uint8_t id) {
-  drawHeaderBar(F("ACCESS GRANTED"), C_OK);
+  drawHeaderBar(F("GRANTED"), C_OK);
 
   char name[10]; uint8_t r, g, b, mel;
   getUser(id, name, &r, &g, &b, &mel);
@@ -611,19 +608,13 @@ void drawOk(uint8_t id) {
   }
 
   // 头像方块 (色块 + 首字母)
-  tft.fillRoundRect(140, 140, 50, 50, 6, userColor);
+  tft.fillRect(140, 140, 50, 50, userColor);
   tft.setTextColor(C_FG);
   tft.setTextSize(4);
   char init = (name[0] != 0 && name[0] != 0xFF) ? name[0] : ('0' + id);
   if (init >= 'a' && init <= 'z') init -= 32;
   tft.setCursor(155, 150);
   tft.print(init);
-
-  // 烟花
-  for (uint8_t i = 0; i < 12; i++) {
-    drawSparkle(random(140, 310), random(40, 220), random(3, 7),
-                (i & 1) ? C_PET : C_PINK);
-  }
 
   // 显示该用户的专属留言
   uint8_t mi = findMessageForUser(id, 0);
@@ -643,19 +634,13 @@ void drawOk(uint8_t id) {
 }
 
 void drawFail() {
-  drawHeaderBar(F("ACCESS DENIED"), C_ERR);
-  for (uint8_t shake = 0; shake < 4; shake++) {
-    int dx = (shake & 1) ? 6 : -6;
-    tft.fillRect(60, 50, 200, 130, C_BG);
-    drawXMark(140 + dx, 90, 50);
-    delay(120);
-  }
+  drawHeaderBar(F("DENIED"), C_ERR);
+  drawXMark(140, 90, 50);
   tft.setTextSize(2);
   tft.setTextColor(C_ERR);
   tft.setCursor(70, 200);
-  tft.print(F("Try Again ("));
+  tft.print(F("Retries: "));
   tft.print(3 - failStreak);
-  tft.print(F(" left)"));
 }
 
 void drawUnlocked() {
@@ -681,47 +666,39 @@ void drawUnlocked() {
   tft.fillRect(barX + 1, barY + 1, prog, barH - 2, C_OK);
   tft.fillRect(barX + 1 + prog, barY + 1, barW - 2 - prog, barH - 2, C_BG);
 
-  // 心心
+  // 心心 (用 2 圆 + 1 矩形代替, 不用 fillTriangle)
   tft.fillCircle(150 - 4, 145, 4, C_PINK);
   tft.fillCircle(150 + 4, 145, 4, C_PINK);
-  tft.fillTriangle(150 - 8, 145, 150 + 8, 145, 150, 156, C_PINK);
+  tft.fillRect(150 - 5, 145, 11, 6, C_PINK);
+  tft.fillRect(150 - 3, 151, 7, 3, C_PINK);
+  tft.fillRect(150 - 1, 154, 3, 2, C_PINK);
 }
 
 void drawLockout() {
-  drawHeaderBar(F("!! LOCKED OUT !!"), C_ERR);
+  drawHeaderBar(F("LOCKED OUT"), C_ERR);
   long remain = 30L - (long)((millis() - lockoutStartMs) / 1000);
   if (remain < 0) remain = 0;
-
-  if (((millis() / 200) % 2) == 0) {
-    tft.fillRect(40, 60, 240, 110, C_ERR);
-    tft.setTextColor(C_FG);
-  } else {
-    tft.fillRect(40, 60, 240, 110, C_BG);
+  if (!_lockoutDrawn) {
+    tft.setTextSize(4);
     tft.setTextColor(C_ERR);
+    tft.setCursor(40, 90);
+    tft.print(F("BLOCKED"));
+    _lockoutDrawn = true;
   }
-  tft.setTextSize(4);
-  tft.setCursor(80, 80);
-  tft.print(F("BRUTE"));
-  tft.setCursor(70, 125);
-  tft.print(F("FORCE"));
-
   tft.fillRect(60, 185, 200, 30, C_BG);
   tft.setTextSize(2);
   tft.setTextColor(C_ERR);
-  tft.setCursor(70, 195);
-  tft.print(F("Wait "));
+  tft.setCursor(80, 195);
   tft.print((int)remain);
-  tft.print(F("s"));
+  tft.print(F(" sec"));
 }
 
 void drawDoorbell() {
-  drawHeaderBar(F("DING DONG"), C_PET);
+  drawHeaderBar(F("Bell"), C_PET);
   tft.setTextSize(3);
   tft.setTextColor(C_PET);
-  tft.setCursor(60, 90);
-  tft.print(F("Visitor at"));
-  tft.setCursor(120, 130);
-  tft.print(F("Door"));
+  tft.setCursor(70, 110);
+  tft.print(F("Visitor"));
 }
 
 void drawHeaderBar(const __FlashStringHelper* title, uint16_t color) {
@@ -730,54 +707,43 @@ void drawHeaderBar(const __FlashStringHelper* title, uint16_t color) {
   tft.setTextColor(C_FG);
   tft.setCursor(8, 6);
   tft.print(title);
-  // 右上角时间/统计
-  tft.setTextSize(1);
-  tft.setCursor(220, 4);
-  tft.print(F("Up:"));
-  tft.print(uptimeHours);
-  tft.print('h');
-  tft.setCursor(220, 16);
-  tft.print(F("Cnt:"));
-  tft.print(unlockCount);
 }
 
 void drawLockIcon(int x, int y, int w, int h, bool open, uint16_t col) {
   int bodyH = h * 6 / 10;
   int bodyY = y + h - bodyH;
-  tft.fillRoundRect(x, bodyY, w, bodyH, 6, col);
+  tft.fillRect(x, bodyY, w, bodyH, col);
   // 钥匙孔
   tft.fillCircle(x + w / 2, bodyY + bodyH / 3, 5, C_BG);
   tft.fillRect(x + w / 2 - 2, bodyY + bodyH / 3, 4, bodyH / 3, C_BG);
-  // 锁环
+  // 锁环 (用 drawCircle + drawLine 拼弧形, 替代 drawRoundRect)
   int shW = w * 6 / 10;
   int shH = h * 5 / 10;
   int sx = x + (w - shW) / 2;
-  if (!open) {
-    tft.drawRoundRect(sx, y, shW, shH + 4, shW / 2, col);
-    tft.drawRoundRect(sx + 1, y, shW - 2, shH + 4, shW / 2, col);
-    tft.drawRoundRect(sx + 2, y, shW - 4, shH + 4, shW / 2, col);
-  } else {
-    int ox = sx + shW - 6;
-    tft.drawRoundRect(ox, y - 4, shW, shH + 4, shW / 2, col);
-    tft.drawRoundRect(ox + 1, y - 4, shW - 2, shH + 4, shW / 2, col);
-    tft.drawRoundRect(ox + 2, y - 4, shW - 4, shH + 4, shW / 2, col);
+  int oy = y;
+  if (open) { sx += shW - 6; oy -= 4; }
+  // 顶部半圆 + 两侧竖线
+  int cx = sx + shW / 2;
+  int cy = oy + shW / 2;
+  for (int t = 0; t < 3; t++) {
+    tft.drawCircle(cx, cy, shW / 2 - t, col);
+    tft.drawFastVLine(sx + t, cy, shH - shW / 2 + 4, col);
+    tft.drawFastVLine(sx + shW - 1 - t, cy, shH - shW / 2 + 4, col);
   }
 }
 
 void drawFpIcon(int x, int y, int r, uint16_t col, uint8_t f) {
   int cx = x + r, cy = y + r;
-  tft.drawRoundRect(x - 4, y - 4, r * 2 + 8, r * 2 + 8, 8, col);
-  // 旋转的指纹纹路 (椭圆)
-  for (int rr = 8; rr < r; rr += 5) {
-    int sa = (f * 12 + rr * 6) % 360;
-    for (int a = 0; a < 240; a += 10) {
-      float rad = (sa + a) * 0.01745;
-      int px = cx + cos(rad) * rr;
-      int py = cy + sin(rad) * (rr * 0.75);
-      if (px >= 0 && px < TFT_W && py >= 0 && py < TFT_H)
-        tft.drawPixel(px, py, col);
-    }
+  tft.drawRect(x - 4, y - 4, r * 2 + 8, r * 2 + 8, col);
+  // 简化的指纹纹路: 同心椭圆 (不用 sin/cos)
+  uint8_t off = (f * 2) & 7;
+  for (int rr = 6; rr < r; rr += 4) {
+    if (((rr + off) & 3) == 0) continue;       // 跳一些做"破口"
+    // 椭圆近似: 用 drawCircle + 横向压缩 (drawCircle 没法压扁, 用两个圆弧近似)
+    tft.drawCircle(cx, cy, rr, col);
   }
+  // 中心一道横线增加纹理感
+  tft.drawFastHLine(cx - r / 2, cy, r, col);
 }
 
 void drawXMark(int x, int y, int s) {
@@ -787,14 +753,7 @@ void drawXMark(int x, int y, int s) {
   }
 }
 
-void drawSparkle(int x, int y, int s, uint16_t col) {
-  tft.drawFastHLine(x - s, y, s * 2, col);
-  tft.drawFastVLine(x, y - s, s * 2, col);
-  tft.drawPixel(x - s + 1, y - s + 1, col);
-  tft.drawPixel(x + s - 1, y - s + 1, col);
-  tft.drawPixel(x - s + 1, y + s - 1, col);
-  tft.drawPixel(x + s - 1, y + s - 1, col);
-}
+// drawSparkle removed (省 flash)
 
 // ==================== 桌面宠物 ====================
 // 32x32 位置, 用基本图形画一只猫
@@ -813,18 +772,19 @@ void drawPet(int x, int y, uint8_t emotion, uint8_t frame) {
   else if (emotion == 2) bodyCol = C_PINK; // excited
   else if (emotion == 3) bodyCol = C_PURPLE;// sad
 
-  // 身体
-  tft.fillRoundRect(x - 12, y - 6, 24, 18, 6, bodyCol);
+  // 身体 (椭圆近似: fillRect + 两端 fillCircle)
+  tft.fillRect(x - 10, y - 6, 20, 18, bodyCol);
+  tft.fillCircle(x - 10, y + 3, 6, bodyCol);
+  tft.fillCircle(x + 10, y + 3, 6, bodyCol);
   // 头
   tft.fillCircle(x, y - 12, 10, bodyCol);
-  // 耳朵
+  // 耳朵 (用小圆代替三角, 省 flash)
   if (emotion == 3) {
-    // 下垂
-    tft.fillTriangle(x - 9, y - 16, x - 4, y - 12, x - 8, y - 8, bodyCol);
-    tft.fillTriangle(x + 9, y - 16, x + 4, y - 12, x + 8, y - 8, bodyCol);
+    tft.fillCircle(x - 8, y - 12, 3, bodyCol);
+    tft.fillCircle(x + 8, y - 12, 3, bodyCol);
   } else {
-    tft.fillTriangle(x - 9, y - 22, x - 4, y - 16, x - 11, y - 14, bodyCol);
-    tft.fillTriangle(x + 9, y - 22, x + 4, y - 16, x + 11, y - 14, bodyCol);
+    tft.fillCircle(x - 8, y - 18, 3, bodyCol);
+    tft.fillCircle(x + 8, y - 18, 3, bodyCol);
   }
   // 眼睛
   if (emotion == 1) {
@@ -868,11 +828,11 @@ void drawPet(int x, int y, uint8_t emotion, uint8_t frame) {
   tft.drawLine(x + 12, y - 2, x + 18 + tailDX, y - 8, bodyCol);
   tft.drawLine(x + 12, y - 1, x + 18 + tailDX, y - 7, bodyCol);
 
-  // 心情泡泡 (excited 时)
+  // 心情泡泡 (excited 时, 用圆代替三角)
   if (emotion == 2 && (frame & 2)) {
     tft.fillCircle(x - 14, y - 22, 3, C_PINK);
-    tft.fillCircle(x - 11, y - 22, 3, C_PINK);
-    tft.fillTriangle(x - 17, y - 22, x - 8, y - 22, x - 12, y - 16, C_PINK);
+    tft.fillCircle(x - 10, y - 22, 3, C_PINK);
+    tft.fillRect(x - 14, y - 22, 5, 5, C_PINK);
   }
 }
 
@@ -920,8 +880,12 @@ void setRGB(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void breathRGB(uint8_t r, uint8_t g, uint8_t b) {
-  float k = (sin(millis() / 800.0) + 1.0) * 0.5;
-  setRGB((uint8_t)(r * k), (uint8_t)(g * k), (uint8_t)(b * k));
+  // 三角波呼吸 (代替 sin, 省 ~2.5KB flash)
+  uint16_t t = (millis() >> 3) & 0x1FF;   // 0..511 周期 ~4s
+  uint8_t k = (t < 256) ? (uint8_t)t : (uint8_t)(511 - t);
+  setRGB((uint8_t)((uint16_t)r * k / 255),
+         (uint8_t)((uint16_t)g * k / 255),
+         (uint8_t)((uint16_t)b * k / 255));
 }
 
 // ==================== 蜂鸣器 ====================
