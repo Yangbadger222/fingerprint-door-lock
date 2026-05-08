@@ -1,41 +1,41 @@
 /*
- * 声纹指纹门锁系统 - Arduino Nano ESP32 专用版
- * MCU: Arduino Nano ESP32 (NORA-W106-10B / ESP32-S3)
- *
- * 核心改动 (相对于 Nano ATmega328P):
- *   - 使用 HardwareSerial Serial1 (D0=RX, D1=TX) 代替 SoftwareSerial
- *   - 3.3V I/O, 指纹模块直连无需分压
- *   - 所有数字引脚均支持 PWM (analogWrite via LEDC), RGB 真彩呼吸
- *   - Serial = USB CDC, 不占用任何引脚
+ * 声纹指纹门锁系统 - Arduino Nano (ATmega328P)
+ * MCU: Arduino Nano ATmega328P (5V 逻辑, AVR)
  *
  * 功能:
  *   - 声音唤醒 (KY-038 + MAX9812)
- *   - 指纹验证 (TM1026M)
+ *   - 指纹验证 (TM1026M, 协议兼容 AS608)
  *   - OLED 多场景动画 (SSD1306 0.96")
- *   - 无源蜂鸣器多段旋律
+ *   - 无源蜂鸣器多段旋律 + 彩蛋
  *   - 继电器控制电磁锁
- *   - RGB LED 状态指示 (真 PWM 渐变)
+ *   - RGB LED 状态指示 (D9/D10/D11 真 PWM 渐变)
  *   - ISD1820 语音播报
+ *
+ * 注意:
+ *   - SoftwareSerial 用 D2(RX)/D3(TX) 接指纹模块
+ *   - PWM 引脚仅 D3/D5/D6/D9/D10/D11
+ *   - TM1026M 是 3.3V 模块, RX(白)需要 5V→3.3V 分压
  */
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_Fingerprint.h>
+#include <SoftwareSerial.h>
 
-// ==================== 引脚定义 (Nano ESP32) ====================
-//   D0 = Serial1 RX  → 指纹 TX
-//   D1 = Serial1 TX  → 指纹 RX
-#define ISD1820_PIN  2    // ISD1820 PLAYE
-#define BUZZER_PIN   3    // 无源蜂鸣器 (PWM/LEDC)
-#define RELAY_PIN    4    // 继电器 IN
-#define RGB_R        5    // RGB-R (PWM)
-#define RGB_G        6    // RGB-G (PWM)
-#define RGB_B        7    // RGB-B (PWM)
-#define MIC_DO       8    // KY-038 数字输出
+// ==================== 引脚定义 ====================
+#define FP_RX        2    // 指纹 TX → D2  (SoftwareSerial RX)
+#define FP_TX        3    // 指纹 RX → D3  (SoftwareSerial TX, 经分压)
+#define ISD1820_PIN  4    // ISD1820 PLAYE
+#define BUZZER_PIN   5    // 无源蜂鸣器 (PWM)
+#define RELAY_PIN    6    // 继电器 IN
+#define MIC_DO       7    // KY-038 数字输出
+#define RGB_R        9    // RGB-R (PWM)
+#define RGB_G        10   // RGB-G (PWM)
+#define RGB_B        11   // RGB-B (PWM)
 #define SOUND_AO     A0   // MAX9812 模拟输出
 
-// 共阴极 RGB: 设为 false; 共阳极: 设为 true
+// 共阴极 RGB: false; 共阳极: true
 #define RGB_COMMON_ANODE  false
 
 // ==================== OLED ====================
@@ -45,8 +45,8 @@
 #define OLED_ADDR     0x3C    // 备用 0x3D
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ==================== 指纹 (硬件串口) ====================
-HardwareSerial &fpSerial = Serial1;
+// ==================== 指纹 (软串口) ====================
+SoftwareSerial fpSerial(FP_RX, FP_TX);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fpSerial);
 
 // ==================== 系统状态 ====================
@@ -57,10 +57,10 @@ enum SystemState {
 SystemState currentState = STATE_IDLE;
 unsigned long stateTimer = 0;
 unsigned long lastAnimFrame = 0;
-uint32_t animFrame = 0;
+uint16_t animFrame = 0;
 int      enrollId = 1;
 bool     enrollMode = false;
-uint16_t unlockCount = 0;     // 累计开锁次数 (>=5 触发彩蛋旋律)
+uint16_t unlockCount = 0;     // 累计开锁次数 (>=5 触发彩蛋)
 
 // ==================== 音符 ====================
 #define NOTE_C4 262
@@ -95,7 +95,6 @@ void drawHeart(int cx, int cy, int size);
 void drawSparkle(int x, int y, int size);
 void setRGB(uint8_t r, uint8_t g, uint8_t b);
 void breathRGB(uint8_t r, uint8_t g, uint8_t b);
-void rainbowRGB();
 bool detectSound();
 int  getFingerprintMatch();
 void playStartupMelody();
@@ -110,12 +109,17 @@ void playISD1820();
 void checkSerialCommand();
 void handleEnroll();
 void showEnrollError();
+void handleIdle();
+void handleWake();
+void handleWaitFinger();
+void handleMatchOK();
+void handleMatchFail();
+void handleUnlocked();
 
 // ==================== setup ====================
 void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println(F("=== 声纹指纹门锁 (Nano ESP32) ==="));
+  Serial.begin(9600);
+  Serial.println(F("=== 声纹指纹门锁 (Nano ATmega328P) ==="));
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RELAY_PIN,  OUTPUT);
@@ -129,11 +133,7 @@ void setup() {
   digitalWrite(ISD1820_PIN, LOW);
   setRGB(0, 0, 0);
 
-  // ESP32 ADC 用 10bit 与下文阈值一致
-  analogReadResolution(10);
-
   // OLED 初始化
-  Wire.begin();
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
       Serial.println(F("OLED 初始化失败!"));
@@ -147,7 +147,7 @@ void setup() {
   playStartupMelody();
 
   // 指纹模块初始化
-  fpSerial.begin(57600, SERIAL_8N1, D0, D1);  // ESP32 显式指定 RX/TX
+  finger.begin(57600);
   delay(100);
   if (finger.verifyPassword()) {
     Serial.println(F("指纹模块: OK"));
@@ -155,7 +155,7 @@ void setup() {
     Serial.print(F("已存指纹: ")); Serial.println(finger.templateCount);
     enrollId = finger.templateCount + 1;
   } else {
-    Serial.println(F("指纹模块: 未找到, 请检查接线/波特率"));
+    Serial.println(F("指纹模块: 未找到, 请检查接线"));
     display.clearDisplay();
     display.setCursor(8, 28);
     display.print(F("FP Sensor Error!"));
@@ -186,7 +186,7 @@ void loop() {
 // ==================== 状态处理 ====================
 void handleIdle() {
   showIdleScreen();
-  breathRGB(60, 0, 0);          // 红色呼吸
+  breathRGB(80, 0, 0);          // 红色呼吸
   if (detectSound()) {
     Serial.println(F("声音唤醒!"));
     currentState = STATE_WAKE;
@@ -206,7 +206,7 @@ void handleWake() {
 
 void handleWaitFinger() {
   showFingerWaitScreen();
-  // 蓝色脉冲
+  // 蓝色脉冲 (用 PWM 真渐变)
   uint8_t v = (sin(millis() / 150.0) + 1.0) * 127;
   setRGB(0, 0, v);
 
@@ -249,7 +249,7 @@ void handleMatchFail() {
 void handleUnlocked() {
   showUnlockedScreen();
   // 绿色随时间渐暗
-  int remain = 5000 - (millis() - stateTimer);
+  long remain = 5000L - (long)(millis() - stateTimer);
   if (remain < 0) remain = 0;
   uint8_t g = map(remain, 0, 5000, 30, 220);
   setRGB(0, g, 0);
@@ -268,7 +268,7 @@ bool detectSound() {
     delay(30);
     if (digitalRead(MIC_DO) == LOW) return true;
   }
-  // MAX9812 模拟检测
+  // MAX9812 模拟检测 (10-bit ADC, 静音中点 ~512)
   int peak = 0;
   for (int i = 0; i < 32; i++) {
     int v = analogRead(SOUND_AO);
@@ -300,15 +300,14 @@ void showBootScreen() {
   }
   display.clearDisplay();
   drawLockIcon(48, 5, 32, true);
-  // 闪烁的星点
   for (int i = 0; i < 6; i++) {
     drawSparkle(random(0, 128), random(0, 64), 3);
   }
   display.setTextSize(1);
   display.setCursor(8, 48);
   display.print(F("Smart Door Lock"));
-  display.setCursor(28, 56);
-  display.print(F("Nano ESP32"));
+  display.setCursor(22, 56);
+  display.print(F("Nano ATmega328"));
   display.display();
   delay(1500);
 }
@@ -319,8 +318,6 @@ void showIdleScreen() {
   animFrame++;
 
   display.clearDisplay();
-
-  // 锁图标 + 周围呼吸圆环
   drawLockIcon(48, 2, 28, true);
   int rr = (animFrame / 4) % 20 + 18;
   display.drawCircle(64, 18, rr, SSD1306_WHITE);
@@ -341,14 +338,11 @@ void showIdleScreen() {
 }
 
 void showWakeAnimation() {
-  // 同心声波扩散 + 呼吸光点
   for (int r = 6; r < 50; r += 4) {
     display.clearDisplay();
-    // 中心麦克风
     display.fillCircle(64, 28, 6, SSD1306_WHITE);
     display.fillRect(62, 34, 4, 8, SSD1306_WHITE);
     display.drawLine(56, 44, 72, 44, SSD1306_WHITE);
-    // 三圈声波
     for (int i = 0; i < 3; i++) {
       int rr = r - i * 8;
       if (rr > 0) {
@@ -371,12 +365,10 @@ void showFingerWaitScreen() {
 
   display.clearDisplay();
   drawFingerprintIcon(50, 2, animFrame);
-
   display.setTextSize(1);
   display.setCursor(15, 40);
   display.print(F("Place Finger..."));
 
-  // 双向流动进度条
   int bw = (animFrame * 4) % 100;
   display.drawRect(14, 54, 100, 8, SSD1306_WHITE);
   display.fillRect(14, 54, bw, 8, SSD1306_WHITE);
@@ -386,11 +378,9 @@ void showFingerWaitScreen() {
 }
 
 void showUnlockAnimation() {
-  // 1) 锁开门动画
   for (int f = 0; f < 8; f++) {
     display.clearDisplay();
     drawLockIcon(48, 5, 28, false);
-    // 放射庆祝线
     for (int i = 0; i < 12; i++) {
       float a = (i * 30 + f * 10) * PI / 180.0;
       int x1 = 64 + cos(a) * (22 + f);
@@ -405,7 +395,6 @@ void showUnlockAnimation() {
     display.display();
     delay(80);
   }
-  // 2) 烟花式星点
   for (int f = 0; f < 6; f++) {
     display.clearDisplay();
     display.setTextSize(2);
@@ -420,7 +409,6 @@ void showUnlockAnimation() {
 }
 
 void showFailAnimation() {
-  // 抖动 + X
   for (int i = 0; i < 4; i++) {
     int sh = (i % 2) ? 3 : -3;
     display.clearDisplay();
@@ -446,17 +434,17 @@ void showUnlockedScreen() {
   drawHeart(20, 30, 6);
   drawHeart(100, 30, 6);
 
-  int remain = 5 - (millis() - stateTimer) / 1000;
+  long remain = 5L - (long)((millis() - stateTimer) / 1000);
   if (remain < 0) remain = 0;
   display.setTextSize(1);
   display.setCursor(20, 40);
   display.print(F("Door Open: "));
-  display.print(remain); display.print(F("s"));
+  display.print((int)remain); display.print(F("s"));
 
-  int prog = map(millis() - stateTimer, 0, 5000, 100, 0);
+  long prog = map((long)(millis() - stateTimer), 0, 5000, 100, 0);
   if (prog < 0) prog = 0;
   display.drawRect(14, 54, 100, 8, SSD1306_WHITE);
-  display.fillRect(14, 54, prog, 8, SSD1306_WHITE);
+  display.fillRect(14, 54, (int)prog, 8, SSD1306_WHITE);
   display.display();
 }
 
@@ -518,7 +506,7 @@ void drawSparkle(int x, int y, int s) {
   display.drawPixel(x + s - 1, y + s - 1, SSD1306_WHITE);
 }
 
-// ==================== RGB LED (真 PWM) ====================
+// ==================== RGB LED (D9/D10/D11 真 PWM) ====================
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   if (RGB_COMMON_ANODE) { r = 255 - r; g = 255 - g; b = 255 - b; }
   analogWrite(RGB_R, r);
@@ -527,7 +515,7 @@ void setRGB(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void breathRGB(uint8_t r, uint8_t g, uint8_t b) {
-  float k = (sin(millis() / 800.0) + 1.0) * 0.5;  // 0..1
+  float k = (sin(millis() / 800.0) + 1.0) * 0.5;
   setRGB(r * k, g * k, b * k);
 }
 
@@ -538,45 +526,45 @@ void playTone(int f, int d) {
   noTone(BUZZER_PIN);
 }
 
-void playStartupMelody() {           // 上升大三和弦 + 顶音
+void playStartupMelody() {
   int n[] = {NOTE_C4, NOTE_E4, NOTE_G4, NOTE_C5, NOTE_E5};
   int d[] = {120, 120, 120, 120, 260};
   for (int i = 0; i < 5; i++) playTone(n[i], d[i]);
 }
 
-void playWakeTone() {                // 叮咚
+void playWakeTone() {
   playTone(NOTE_E5, 100);
   playTone(NOTE_C5, 140);
 }
 
-void playSuccessMelody() {           // 欢快上行 + 装饰音
+void playSuccessMelody() {
   int n[] = {NOTE_C5, NOTE_E5, NOTE_G5, NOTE_C6, NOTE_G5, NOTE_C6};
   int d[] = {110, 110, 110, 180, 90, 260};
   for (int i = 0; i < 6; i++) playTone(n[i], d[i]);
 }
 
-void playFailTone() {                // 错误警告: 三连下行 + 嗡音
+void playFailTone() {
   int n[] = {500, 400, 300, 200, 200};
   int d[] = {180, 180, 180, 220, 220};
   for (int i = 0; i < 5; i++) playTone(n[i], d[i]);
 }
 
-void playLockTone() {                // 上锁: 平稳下行
+void playLockTone() {
   playTone(NOTE_G4, 110);
   playTone(NOTE_E4, 110);
   playTone(NOTE_C4, 220);
 }
 
-void playTimeoutTone() {             // 两声短促
+void playTimeoutTone() {
   playTone(NOTE_A4, 80);
   playTone(NOTE_A4, 80);
 }
 
-void playEnrollTone() {              // 录入提示
+void playEnrollTone() {
   playTone(NOTE_D5, 160);
 }
 
-// 彩蛋: 简短的"超级玛丽"风格升级音
+// 彩蛋: 简短"超级玛丽"风格
 void playEasterEgg() {
   int n[] = {NOTE_E5, NOTE_E5, REST,    NOTE_E5,
              REST,    NOTE_C5, NOTE_E5, NOTE_G5,
