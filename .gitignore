@@ -2,3 +2,6 @@
 **/.DS_Store
 *.log
 build/
+
+# Test sketches (独立模块测试, 不上传)
+test_*/

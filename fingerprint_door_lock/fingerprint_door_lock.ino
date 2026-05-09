@@ -99,6 +99,12 @@ Adafruit_Fingerprint finger(&fpSerial);
 #define USER_ACTIVE_FLAG 0xAA
 #define MSG_ACTIVE_FLAG  0xAA
 
+// 口令波形包络
+#define EE_VP_ACTIVE  850     // 1B: 0xAA=已录制
+#define EE_VP_DATA    851     // 100B: 归一化包络
+#define VP_POINTS     100
+#define VP_THRESH     30      // 匹配阈值
+
 // 用户结构 (16B):
 //  [0]=active(0xAA)  [1..9]=name(8 char + null)
 //  [10]=R [11]=G [12]=B  [13]=melodyId (0..3)
@@ -111,7 +117,7 @@ Adafruit_Fingerprint finger(&fpSerial);
 
 // ==================== 系统状态 ====================
 enum SysState {
-  S_IDLE, S_WAKE, S_WAIT_FP,
+  S_IDLE, S_WAKE, S_PASSPHRASE, S_WAIT_FP,
   S_OK, S_FAIL, S_UNLOCKED, S_LOCKOUT, S_DOORBELL
 };
 SysState state = S_IDLE;
@@ -173,14 +179,14 @@ void drawOk(uint8_t id);
 void drawFail();
 void drawUnlocked();
 void drawLockout();
-void drawDoorbell();
 void drawHeaderBar(const __FlashStringHelper* title, uint16_t color);
 void drawLockIcon(int x, int y, int w, int h, bool open, uint16_t col);
 void drawFpIcon(int x, int y, int r, uint16_t col, uint8_t f);
 void drawPet(int x, int y, uint8_t emotion, uint8_t frame);
 void drawMsgBanner();
 void drawXMark(int x, int y, int s);
-// drawSparkle removed
+void drawPassphrase(bool checking);
+bool captureEnvelope(uint8_t* buf);
 
 void setRGB(uint8_t r, uint8_t g, uint8_t b);
 void breathRGB(uint8_t r, uint8_t g, uint8_t b);
@@ -195,7 +201,6 @@ void playFail();
 void playLockTone();
 void playTimeout();
 void playEnrollTone();
-void playEaster();
 void playDoorbell();
 void playISD1820();
 
@@ -205,18 +210,12 @@ void saveUnlockCount();
 
 void getUser(uint8_t id, char* nameOut, uint8_t* r, uint8_t* g, uint8_t* b, uint8_t* mel);
 bool setUser(uint8_t id, const char* name, uint8_t r, uint8_t g, uint8_t b, uint8_t mel);
-void listUsers();
-
 bool addMessage(uint8_t target, uint8_t flags, uint16_t ttl, const char* text);
-void deleteMessage(uint8_t idx);
-void clearMessages();
-void listMessages();
 uint8_t findMessageForUser(uint8_t userId, uint8_t startFrom);
 void markRead(uint8_t idx);
 void refreshUnreadFlag();
 
 void logUnlock(uint8_t id);
-void printLog();
 
 void updateUptime();
 void updatePet();
@@ -296,11 +295,12 @@ void loop() {
   if (enrollMode) { handleEnroll(); return; }
 
   switch (state) {
-    case S_IDLE:     handleIdle();     break;
-    case S_WAKE:     handleWake();     break;
-    case S_WAIT_FP:  handleWaitFp();   break;
-    case S_OK:       handleOk();       break;
-    case S_FAIL:     handleFail();     break;
+    case S_IDLE:       handleIdle();       break;
+    case S_WAKE:       handleWake();       break;
+    case S_PASSPHRASE: handlePassphrase(); break;
+    case S_WAIT_FP:    handleWaitFp();     break;
+    case S_OK:         handleOk();         break;
+    case S_FAIL:       handleFail();       break;
     case S_UNLOCKED: handleUnlocked(); break;
     case S_LOCKOUT:  handleLockout();  break;
     case S_DOORBELL: handleDoorbell(); break;
@@ -339,10 +339,49 @@ void handleWake() {
     drawWake();
   }
   if (millis() - stateT > 1500) {
-    state = S_WAIT_FP;
+    // 有口令模板时先进入口令验证, 否则直接等指纹
+    state = (EEPROM.read(EE_VP_ACTIVE) == 0xAA) ? S_PASSPHRASE : S_WAIT_FP;
     stateT = millis();
     tft.fillScreen(C_BG);
     animFrame = 0;
+  }
+}
+
+void handlePassphrase() {
+  drawPassphrase(true);
+  setRGB(0, 0, 180);
+
+  uint8_t envBuf[VP_POINTS];
+  bool ok = captureEnvelope(envBuf);
+  if (!ok) {
+    // 没检测到声音, 超时后直接跳到指纹
+    if (millis() - stateT > 5000) {
+      state = S_WAIT_FP; stateT = millis();
+      tft.fillScreen(C_BG); animFrame = 0;
+    }
+    return;
+  }
+
+  // 比对
+  uint16_t diff = 0;
+  for (uint8_t i = 0; i < VP_POINTS; i++) {
+    uint8_t tpl = EEPROM.read(EE_VP_DATA + i);
+    int d = (int)envBuf[i] - (int)tpl;
+    if (d < 0) d = -d;
+    diff += d;
+  }
+  uint8_t score = diff / VP_POINTS;
+
+  if (score < VP_THRESH) {
+    // 口令通过 → 进入指纹验证
+    playTone(N_E5, 80);
+    state = S_WAIT_FP; stateT = millis();
+    tft.fillScreen(C_BG); animFrame = 0;
+  } else {
+    // 口令失败
+    failStreak++;
+    state = S_FAIL; stateT = millis();
+    tft.fillScreen(C_BG);
   }
 }
 
@@ -395,8 +434,7 @@ void handleOk() {
   getUser(lastMatchedId, nm, &r, &g, &b, &mel);
 
   if (!silentMode) {
-    if (unlockCount % 5 == 0) playEaster();
-    else                      playSuccess(mel);
+    playSuccess(mel);
     playISD1820();
   }
   state = S_UNLOCKED;
@@ -466,7 +504,9 @@ void handleLockout() {
 }
 
 void handleDoorbell() {
-  drawDoorbell();
+  drawHeaderBar(F("Bell"), C_PET);
+  tft.setTextSize(3); tft.setTextColor(C_PET);
+  tft.setCursor(70, 110); tft.print(F("Visitor"));
   if (!silentMode) playDoorbell();
   delay(1500);
   state = S_IDLE;
@@ -496,6 +536,43 @@ int fpMatch() {
   if (finger.image2Tz() != FINGERPRINT_OK) return -1;
   if (finger.fingerFastSearch() == FINGERPRINT_OK) return finger.fingerID;
   return -2;
+}
+
+// ==================== 口令波形 ====================
+bool captureEnvelope(uint8_t* buf) {
+  // 等待声音起始 (最多 3 秒)
+  unsigned long t0 = millis();
+  while (millis() - t0 < 3000) {
+    int peak = 0;
+    for (uint8_t s = 0; s < 10; s++) {
+      int v = analogRead(SOUND_AO);
+      int d = v - 512; if (d < 0) d = -d;
+      if (d > peak) peak = d;
+      delayMicroseconds(180);
+    }
+    if (peak > 50) break;
+  }
+  if (millis() - t0 >= 3000) return false;
+
+  // 采集 100 个包络点
+  uint8_t maxPk = 1;
+  for (uint8_t i = 0; i < VP_POINTS; i++) {
+    uint8_t pk = 0;
+    for (uint8_t s = 0; s < 10; s++) {
+      int v = analogRead(SOUND_AO);
+      int d = v - 512; if (d < 0) d = -d;
+      if (d > 255) d = 255;
+      if (d > pk) pk = (uint8_t)d;
+      delayMicroseconds(180);
+    }
+    buf[i] = pk;
+    if (pk > maxPk) maxPk = pk;
+    delay(28);
+  }
+  // 归一化
+  for (uint8_t i = 0; i < VP_POINTS; i++)
+    buf[i] = (uint8_t)((uint16_t)buf[i] * 255 / maxPk);
+  return true;
 }
 
 // ==================== Drawing ====================
@@ -624,11 +701,9 @@ void drawOk(uint8_t id) {
     for (uint8_t i = 0; i < 80; i++) buf[i] = EEPROM.read(base + 8 + i);
     buf[80] = 0;
     tft.fillRect(20, 200, 280, 36, C_PURPLE);
-    tft.drawRect(20, 200, 280, 36, C_FG);
     tft.setTextColor(C_FG);
     tft.setTextSize(1);
     tft.setCursor(28, 208);
-    tft.print(F("[MSG] "));
     tft.print(buf);
   }
 }
@@ -665,13 +740,6 @@ void drawUnlocked() {
   if (prog < 0) prog = 0;
   tft.fillRect(barX + 1, barY + 1, prog, barH - 2, C_OK);
   tft.fillRect(barX + 1 + prog, barY + 1, barW - 2 - prog, barH - 2, C_BG);
-
-  // 心心 (用 2 圆 + 1 矩形代替, 不用 fillTriangle)
-  tft.fillCircle(150 - 4, 145, 4, C_PINK);
-  tft.fillCircle(150 + 4, 145, 4, C_PINK);
-  tft.fillRect(150 - 5, 145, 11, 6, C_PINK);
-  tft.fillRect(150 - 3, 151, 7, 3, C_PINK);
-  tft.fillRect(150 - 1, 154, 3, 2, C_PINK);
 }
 
 void drawLockout() {
@@ -693,12 +761,12 @@ void drawLockout() {
   tft.print(F(" sec"));
 }
 
-void drawDoorbell() {
-  drawHeaderBar(F("Bell"), C_PET);
-  tft.setTextSize(3);
-  tft.setTextColor(C_PET);
-  tft.setCursor(70, 110);
-  tft.print(F("Visitor"));
+void drawPassphrase(bool checking) {
+  drawHeaderBar(F("Voice?"), C_WAKE);
+  tft.setTextSize(2);
+  tft.setTextColor(C_FG);
+  tft.setCursor(80, 110);
+  tft.print(F("Say passphrase"));
 }
 
 void drawHeaderBar(const __FlashStringHelper* title, uint16_t color) {
@@ -805,13 +873,11 @@ void drawPet(int x, int y, uint8_t emotion, uint8_t frame) {
     tft.drawPixel(x + 2, y - 12, C_FG);
     tft.drawPixel(x + 6, y - 12, C_FG);
   } else if (emotion == 3) {
-    // sad: T_T
+    // sad: X_X
     tft.drawLine(x - 6, y - 14, x - 2, y - 10, C_BG);
     tft.drawLine(x - 2, y - 14, x - 6, y - 10, C_BG);
     tft.drawLine(x + 2, y - 14, x + 6, y - 10, C_BG);
     tft.drawLine(x + 6, y - 14, x + 2, y - 10, C_BG);
-    // 泪
-    tft.fillCircle(x - 7, y - 8, 1, C_WAKE);
   } else {
     // happy: 圆眼
     tft.fillCircle(x - 4, y - 12, 2, C_BG);
@@ -827,13 +893,6 @@ void drawPet(int x, int y, uint8_t emotion, uint8_t frame) {
   int tailDX = (frame & 1) ? 4 : -4;
   tft.drawLine(x + 12, y - 2, x + 18 + tailDX, y - 8, bodyCol);
   tft.drawLine(x + 12, y - 1, x + 18 + tailDX, y - 7, bodyCol);
-
-  // 心情泡泡 (excited 时, 用圆代替三角)
-  if (emotion == 2 && (frame & 2)) {
-    tft.fillCircle(x - 14, y - 22, 3, C_PINK);
-    tft.fillCircle(x - 10, y - 22, 3, C_PINK);
-    tft.fillRect(x - 14, y - 22, 5, 5, C_PINK);
-  }
 }
 
 // ==================== 留言滚动 ====================
@@ -928,12 +987,6 @@ void playSuccess(uint8_t mel) {
   }
 }
 
-void playEaster() {
-  int n[] = {N_E5, N_E5, 0, N_E5, 0, N_C5, N_E5, N_G5, 0, N_G4};
-  int d[] = {110, 110, 70, 110, 70, 110, 110, 220, 70, 220};
-  for (uint8_t i = 0; i < 10; i++) playTone(n[i], d[i]);
-}
-
 void playDoorbell() {
   playTone(N_E5, 220);
   playTone(N_C5, 360);
@@ -1023,20 +1076,6 @@ bool setUser(uint8_t id, const char* name, uint8_t r, uint8_t g, uint8_t b, uint
   return true;
 }
 
-void listUsers() {
-  Serial.println(F("ID | Name     | Color       | Mel"));
-  for (uint8_t i = 1; i <= EE_USER_MAX; i++) {
-    char nm[10]; uint8_t r, g, b, m;
-    getUser(i, nm, &r, &g, &b, &m);
-    if (nm[0] == 0) continue;
-    Serial.print(i); Serial.print(F(" | "));
-    Serial.print(nm); Serial.print(F(" | "));
-    Serial.print(r); Serial.print(','); Serial.print(g); Serial.print(',');
-    Serial.print(b); Serial.print(F("  | "));
-    Serial.println(m);
-  }
-}
-
 // ==================== Messages ====================
 bool addMessage(uint8_t target, uint8_t flags, uint16_t ttl, const char* text) {
   // 找第一个空槽
@@ -1062,33 +1101,6 @@ bool addMessage(uint8_t target, uint8_t flags, uint16_t ttl, const char* text) {
     }
   }
   return false;
-}
-
-void deleteMessage(uint8_t idx) {
-  if (idx >= EE_MSG_MAX) return;
-  EEPROM.update(EE_MSG_BASE + (uint16_t)idx * EE_MSG_SZ, 0);
-  refreshUnreadFlag();
-}
-
-void clearMessages() {
-  for (uint8_t i = 0; i < EE_MSG_MAX; i++) deleteMessage(i);
-}
-
-void listMessages() {
-  Serial.println(F("idx tgt rd  text"));
-  for (uint8_t i = 0; i < EE_MSG_MAX; i++) {
-    uint16_t base = EE_MSG_BASE + (uint16_t)i * EE_MSG_SZ;
-    if (EEPROM.read(base) != MSG_ACTIVE_FLAG) continue;
-    Serial.print(i); Serial.print(F("   "));
-    Serial.print(EEPROM.read(base + 1)); Serial.print(F("   "));
-    Serial.print(EEPROM.read(base + 2) ? F("Y ") : F("N "));
-    for (uint8_t k = 0; k < 80; k++) {
-      char c = EEPROM.read(base + 8 + k);
-      if (!c) break;
-      Serial.write(c);
-    }
-    Serial.println();
-  }
 }
 
 uint8_t findMessageForUser(uint8_t userId, uint8_t startFrom) {
@@ -1137,22 +1149,6 @@ void logUnlock(uint8_t id) {
   EEPROM.update(addr + 4, 0);
   EEPROM.update(addr + 5, 0);
   EEPROM.update(EE_LOG_HEAD, (head + 1) % EE_LOG_MAX);
-}
-
-void printLog() {
-  Serial.println(F("== Unlock Log =="));
-  uint8_t head = EEPROM.read(EE_LOG_HEAD) % EE_LOG_MAX;
-  for (uint8_t i = 0; i < EE_LOG_MAX; i++) {
-    uint8_t idx = (head + EE_LOG_MAX - 1 - i) % EE_LOG_MAX;
-    uint16_t addr = EE_LOG_BASE + (uint16_t)idx * EE_LOG_SZ;
-    uint8_t id = EEPROM.read(addr);
-    if (id == 0) continue;
-    uint16_t h = EEPROM.read(addr + 1) | ((uint16_t)EEPROM.read(addr + 2) << 8);
-    Serial.print(F("ID=")); Serial.print(id);
-    Serial.print(F(" hour=")); Serial.print(h);
-    Serial.print(F(" ago=")); Serial.print(uptimeHours - h);
-    Serial.println('h');
-  }
 }
 
 // ==================== Uptime/Pet ====================
@@ -1210,9 +1206,9 @@ void processCmd(char* line) {
   // 剥离开头空格
   while (*line == ' ') line++;
   if (line[0] == 'h' && line[1] == 'e') { // help
-    Serial.println(F("e | d | u<id> <name> <r> <g> <b> <mel> | ul"));
-    Serial.println(F("m <text> | m@<id> <text> | m! <text> | ml | md<idx> | mc"));
-    Serial.println(F("log | silent | stats"));
+    Serial.println(F("e | d | u<id> <n> <r> <g> <b> <m>"));
+    Serial.println(F("m <txt> | m@<id> <txt> | m! <txt>"));
+    Serial.println(F("silent | vc | vd | vs"));
     return;
   }
   if (line[0] == 'e') {
@@ -1233,7 +1229,6 @@ void processCmd(char* line) {
     enrollId = 1;
     return;
   }
-  if (line[0] == 'u' && line[1] == 'l') { listUsers(); return; }
   if (line[0] == 'u' && line[1] == ' ') {
     // u <id> <name> <r> <g> <b> <mel>
     char* p = line + 2;
@@ -1253,14 +1248,6 @@ void processCmd(char* line) {
     } else Serial.println(F("Bad id"));
     return;
   }
-  if (line[0] == 'm' && line[1] == 'l') { listMessages(); return; }
-  if (line[0] == 'm' && line[1] == 'c') { clearMessages(); Serial.println(F("Cleared")); return; }
-  if (line[0] == 'm' && line[1] == 'd') {
-    uint8_t idx = atoi(line + 2);
-    deleteMessage(idx);
-    Serial.print(F("Deleted ")); Serial.println(idx);
-    return;
-  }
   if (line[0] == 'm' && line[1] == '@') {
     char* p = line + 2;
     uint8_t id = atoi(p);
@@ -1277,18 +1264,32 @@ void processCmd(char* line) {
     if (addMessage(0, 0, 0xFFFF, line + 2)) Serial.println(F("Msg saved"));
     return;
   }
-  if (strncmp_P(line, PSTR("log"), 3) == 0) { printLog(); return; }
   if (strncmp_P(line, PSTR("silent"), 6) == 0) {
     silentMode = !silentMode;
     EEPROM.update(EE_SILENT, silentMode ? 1 : 0);
     Serial.print(F("Silent=")); Serial.println(silentMode);
     return;
   }
-  if (strncmp_P(line, PSTR("stats"), 5) == 0) {
-    Serial.print(F("Unlocks=")); Serial.println(unlockCount);
-    Serial.print(F("Up h="));    Serial.println(uptimeHours);
-    Serial.print(F("PetXP="));   Serial.println(petXP);
-    Serial.print(F("Emotion=")); Serial.println(petEmotion);
+  // 口令命令
+  if (line[0] == 'v' && line[1] == 'c') {
+    Serial.println(F("Say in 3s..."));
+    delay(3000);
+    uint8_t envBuf[VP_POINTS];
+    if (captureEnvelope(envBuf)) {
+      EEPROM.update(EE_VP_ACTIVE, 0xAA);
+      for (uint8_t i = 0; i < VP_POINTS; i++)
+        EEPROM.update(EE_VP_DATA + i, envBuf[i]);
+      Serial.println(F("Saved!"));
+    } else Serial.println(F("No sound"));
+    return;
+  }
+  if (line[0] == 'v' && line[1] == 'd') {
+    EEPROM.update(EE_VP_ACTIVE, 0);
+    Serial.println(F("Deleted"));
+    return;
+  }
+  if (line[0] == 'v' && line[1] == 's') {
+    Serial.println(EEPROM.read(EE_VP_ACTIVE) == 0xAA ? F("Voice: ON") : F("Voice: OFF"));
     return;
   }
   if (line[0]) { Serial.print(F("?? ")); Serial.println(line); }

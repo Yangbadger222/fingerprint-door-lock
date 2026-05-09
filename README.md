@@ -25,8 +25,8 @@
 | 🌈 **RGB 状态灯** | 真 PWM 呼吸 (D5/D9/D10), 状态色彩切换 |
 | 🔓 **电磁锁** | 5V 继电器控制 12V 电磁锁, 5 秒后自动上锁 |
 | 🗣️ **语音播报** | ISD1820 录音模块播放"欢迎回家" |
+| 🔊 **口令匹配** | MAX9812 录制口令波形包络, 解锁时先验证口令再验指纹 |
 | 🤫 **静音模式** | 串口 `silent` 切换, 夜归不扰民 |
-| 🎁 **彩蛋** | 累计解锁满 5 次播放"超级玛丽"风格升级音 🍄 |
 
 ---
 
@@ -68,6 +68,16 @@
 | **D13** | **TFT SCK** | SPI |
 | **A1 / A2 / A3** | TFT CS / DC / RST | 数字输出 |
 | A0 | MAX9812 OUT | 模拟 |
+
+### 未在引脚表中展开的模块接线
+
+| 模块 | VCC | GND | 信号引脚 | 注意事项 |
+|:--|:--|:--|:--|:--|
+| KY-038 麦克风 | 5V | GND | DO → D7 | 蓝色电位器调灵敏度 |
+| MAX9812 波形 | **3.3V** | GND | OUT → A0 | 不是 5V! |
+| ISD1820 语音 | 5V | GND | PLAYE → D4 | 先录音再接 Arduino |
+| 继电器 | 5V | GND | IN → D6 | COM 接 12V+, NO 接电磁锁+ |
+| TM1026M 指纹 | **3.3V** | GND | TX → D2, RX → D3(**分压**) | D3→1KΩ→节点→2KΩ→GND, 节点→RX |
 
 > 完整接线图、电源拓扑、EEPROM 数据布局见 [`声纹指纹门锁系统-完整方案.md`](./声纹指纹门锁系统-完整方案.md)
 
@@ -301,6 +311,95 @@ for (int i = 0; i < 1024; i++) EEPROM.update(i, 0xFF);
 
 ---
 
+## 🧪 模块逐项测试
+
+组装完整系统之前, 建议逐个模块独立测试。每个测试是独立 sketch, 单独编译上传。
+
+| 测试目录 | 测试内容 | 引脚 |
+|:--|:--|:--|
+| `test_tft/` | TFT 全部 9 个界面循环展示 (低闪烁版) | A1/A2/A3/D11/D13 |
+| `test_buzzer_led/` | 蜂鸣器全部旋律 + RGB LED 逐色 + 呼吸灯 | D5/D8/D9/D10 |
+| `test_mic/` | KY-038 数字触发 + MAX9812 波形柱状图 | D7/A0 |
+| `test_isd1820/` | ISD1820 自动播放 (每 5s) + 手动触发 | D4 |
+| `test_relay/` | 继电器自动通断 (每 2s) + 手动控制 | D6 |
+| `test_fingerprint/` | TM1026M 检测/录入/匹配/清空/计数 | D2/D3 (分压) |
+| `test_passphrase/` | 口令波形录制 + 匹配分数测试 | A0/D7 |
+
+**推荐测试顺序**: TFT → 蜂鸣器LED → 麦克风 → 语音 → 继电器 → 指纹 → 口令 → 主程序
+
+#### 各测试接线速查
+
+**test_tft** — TFT 屏幕:
+| TFT | Nano | 备注 |
+|:--|:--|:--|
+| VCC | 5V | |
+| GND | GND | |
+| CS | A1 | |
+| RESET | A3 | |
+| DC/RS | A2 | |
+| MOSI | D11 | |
+| SCK | D13 | |
+| LED | 5V | 背光 |
+
+**test_buzzer_led** — 蜂鸣器 + RGB:
+| 模块 | Nano | 备注 |
+|:--|:--|:--|
+| 蜂鸣器 S(+) | D8 | |
+| RGB-R | D9 | 串 220Ω |
+| RGB-G | D10 | 串 220Ω |
+| RGB-B | D5 | 串 220Ω, **不是 D11** |
+| RGB-GND | GND | 共阴极 |
+
+**test_mic** — 麦克风:
+| 模块 | Nano | 备注 |
+|:--|:--|:--|
+| KY-038 VCC | 5V | |
+| KY-038 DO | D7 | 有声音时 LOW |
+| MAX9812 VCC | **3.3V** | 不是 5V! |
+| MAX9812 OUT | A0 | 模拟波形 |
+
+**test_isd1820** — 语音模块:
+| ISD1820 | Nano | 备注 |
+|:--|:--|:--|
+| VCC | 5V | |
+| GND | GND | |
+| PLAYE | D4 | 边沿触发 |
+| SP+/- | 喇叭 | 8Ω 0.5W |
+
+> 先录音再测试: 按住 REC → 说"欢迎回家" → 松开 → 验证 → 再接 D4
+
+**test_relay** — 继电器:
+| 继电器 | Nano | 备注 |
+|:--|:--|:--|
+| VCC | 5V | |
+| GND | GND | |
+| IN | D6 | 高电平触发 |
+| COM/NO | 12V+电磁锁 | 可不接, 听咔嗒声即可 |
+
+**test_fingerprint** — 指纹传感器 (**最复杂**):
+| TM1026M | Nano | 备注 |
+|:--|:--|:--|
+| VCC (红) | **3.3V** | 接 5V 会烧! |
+| TX (绿) | D2 | SoftwareSerial RX |
+| RX (白) | D3 经分压 | D3→1KΩ→节点→2KΩ→GND, 节点→RX |
+
+**test_passphrase** — 口令匹配:
+| 模块 | Nano | 备注 |
+|:--|:--|:--|
+| MAX9812 VCC | **3.3V** | |
+| MAX9812 OUT | A0 | 模拟采样 |
+| KY-038 DO | D7 | 可选, 快速触发 |
+
+> 完整接线细节见 [`声纹指纹门锁系统-完整方案.md`](./声纹指纹门锁系统-完整方案.md) §13
+
+```bash
+# 编译 + 上传示例
+arduino-cli compile --fqbn arduino:avr:nano test_tft
+arduino-cli upload -p /dev/cu.usbserial-110 --fqbn arduino:avr:nano test_tft
+```
+
+---
+
 ## 🗂️ 项目结构
 
 ```
@@ -308,6 +407,13 @@ for (int i = 0; i < 1024; i++) EEPROM.update(i, 0xFF);
 ├── README.md                          ← 本文件
 ├── fingerprint_door_lock/
 │   └── fingerprint_door_lock.ino      ← 主程序 v2.0
+├── test_tft/                          ← 模块测试: TFT 屏幕
+├── test_buzzer_led/                   ← 模块测试: 蜂鸣器 + RGB LED
+├── test_mic/                          ← 模块测试: KY-038 + MAX9812
+├── test_isd1820/                      ← 模块测试: ISD1820 语音
+├── test_relay/                        ← 模块测试: 继电器
+├── test_fingerprint/                  ← 模块测试: TM1026M 指纹
+├── test_passphrase/                   ← 模块测试: 口令波形匹配
 ├── 声纹指纹门锁系统-完整方案.md       ← 详细接线 / EEPROM / 排错文档
 ├── 1.贴片式RGB三原色LED/              ← 模块资料
 ├── 2.声音波形模块(MAX9812)/
@@ -354,12 +460,9 @@ for (int i = 0; i < 1024; i++) EEPROM.update(i, 0xFF);
 |:--|:--|
 | `e` / `d` | 录入 / 清空指纹 |
 | `u <id> <name> <r> <g> <b> <mel>` | 设置用户 |
-| `ul` | 列出用户 |
 | `m <text>` / `m@<id> <text>` / `m! <text>` | 群发/定向/置顶留言 |
-| `ml` / `md <idx>` / `mc` | 列表/删除/清空留言 |
-| `log` | 查看解锁日志 |
 | `silent` | 切换静音 |
-| `stats` | 查看统计 |
+| `vc` / `vd` / `vs` | 录制/删除/查看口令 |
 | `help` | 帮助 |
 
 ---
